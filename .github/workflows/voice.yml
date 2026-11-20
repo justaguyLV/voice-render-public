@@ -1,0 +1,56 @@
+name: Voice samples (Habibi-TTS)
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  tts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {id: sau-najdi, model: Unified, dialect: SAU, ref: assets/Najdi.wav, text: "تكفى طمني انا اليوم ماني بنايم ولا هو بداخل عيني النوم الين اتطمن عليه."}
+          - {id: sau-gulf, model: Unified, dialect: SAU, ref: assets/Gulf.wav, text: "وين تو الناس متى تصحى ومتى تفطر وتغير يبيلك ساعة يعني بالله تروح الشغل الساعة عشره."}
+          - {id: uae, model: Unified, dialect: UAE, ref: assets/UAE.wav, text: "قمنا نشتريها بشكل متكرر أو لما نلقى ستايل يعجبنا وحياناً هذا الستايل ما نحبه."}
+          - {id: irq-apache, model: Specialized, dialect: IRQ, ref: assets/IRQ.wav, text: "يعني ااا ما نقدر ناخذ وقت أكثر، ااا لأنه شروط كلش يحتاجلها وقت."}
+    env:
+      ID: ${{ matrix.id }}
+      REF_TEXT: ${{ matrix.text }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Install
+        run: |
+          set -o pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1 | tee install.log
+          printf 'torch==2.8.0+cpu\ntorchaudio==2.8.0+cpu\n' > c.txt
+          (pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu && pip install -c c.txt habibi-tts soundfile scipy numpy --extra-index-url https://download.pytorch.org/whl/cpu && pip list 2>/dev/null | grep -i -E "^(torch|torchaudio|torchcodec|f5-tts|habibi)") 2>&1 | tail -n 40 | tee -a install.log
+          df -h / | tail -1 | tee -a install.log
+      - name: Generate (one chunk per script line)
+        run: |
+          python - <<'PY'
+          import json
+          L = json.load(open("voice/lines.json", encoding="utf-8"))
+          open("gen.txt", "w", encoding="utf-8").write("\n".join("[main] " + s for _, s, _ in L) + "\n")
+          PY
+          habibi-tts_infer-cli --model "${{ matrix.model }}" --dialect "${{ matrix.dialect }}" \
+            --ref_audio "${{ matrix.ref }}" --ref_text "$REF_TEXT" --gen_file gen.txt \
+            --output_dir "out/$ID" --output_file full.wav --save_chunk --device cpu --nfe_step 20 > gen.log 2>&1 || echo "EXIT CODE $?" >> gen.log
+          tail -n 60 gen.log; ls -la "out/$ID" || true
+      - name: Assemble
+        run: |
+          python voice/assemble.py "out/$ID/full_chunks" voice/lines.json "res/$ID" > asm.log 2>&1 || echo "ASSEMBLE FAILED" >> asm.log
+          ffmpeg -y -loglevel error -i "res/$ID/voice.wav" -af "loudnorm=I=-16:TP=-1.5" -b:a 192k "res/$ID/voice_$ID.mp3" >> asm.log 2>&1 || echo "FFMPEG FAILED" >> asm.log
+          cat asm.log
+      - name: Push results to a branch
+        if: always()
+        run: |
+          mkdir -p logs keep; { tail -n 70 install.log; echo ----GEN----; tail -n 40 gen.log; echo ----ASM----; cat asm.log; echo ----FILES----; ls -R out res | head -50; } > "logs/$ID.log" 2>&1 || true
+          cp -r "out/$ID/full_chunks" "keep/chunks" 2>/dev/null || true
+          cp "res/$ID/voice_$ID.mp3" "res/$ID/voice.wav" "res/$ID/segs.json" keep/ 2>/dev/null || true
+          git config user.name bot; git config user.email bot@users.noreply.github.com
+          git checkout -b "voice-$ID-${{ github.run_id }}"; git add -f logs keep; git commit -qm "voice $ID"; git push -q origin HEAD
